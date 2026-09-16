@@ -13,8 +13,14 @@ Runs in a scheduled workflow (no laptop needed). Each invocation:
 4. Uploads the final checkpoint + updated memoire.db back to the Hub.
 
 Runs on GitHub's free hosted runners: 2 CPU cores, 7GB RAM, no GPU.
-That RAM ceiling is why this uses the 0.5B model (not 1.5B) and plain
-SGD (no momentum -- AdamW's extra per-parameter state would not fit).
+That RAM ceiling is why this uses LoRA (freezes the big pretrained model,
+trains only a small adapter) instead of full fine-tuning -- full
+fine-tuning of a 1.5B model needs ~12GB+ even with plain SGD, which does
+not fit; LoRA on the frozen fp16 base needs only ~3-4GB. LoRA is also why
+this can afford to use DeepSeek-R1-Distill-Qwen-1.5B (a model distilled
+specifically to reason step-by-step, not just imitate answer tone) instead
+of a plain instruction model -- full fine-tuning that model would not fit
+here at all.
 """
 import os
 import re
@@ -24,6 +30,7 @@ import time
 import requests
 import torch
 from huggingface_hub import hf_hub_download, upload_file
+from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # --- config from environment (set as GitHub Secrets / workflow env) -------
@@ -36,7 +43,7 @@ CHECKPOINT_PUSH_EVERY_S = 20 * 60  # push mid-run progress to the Hub every 20 m
 
 DB_PATH = "/tmp/memoire.db"
 CHECKPOINT_PATH = "/tmp/monia_entrainee.pth"
-NOM_MODELE = "Qwen/Qwen2.5-0.5B-Instruct"
+NOM_MODELE = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 device = "cpu"
 
 debut_script = time.time()
@@ -59,19 +66,25 @@ except Exception as e:
         "It needs to exist there before the first run -- upload it once manually."
     )
 
+# Filename includes the model name deliberately -- switching base models
+# (e.g. away from the earlier plain Qwen2.5-0.5B run) means a differently
+# shaped state dict, so this avoids ever trying to load one architecture's
+# weights into another instead of silently crashing on a shape mismatch.
+CHECKPOINT_NOM_HUB = "monia_deepseek_r1_distill_1.5b_lora_merged.pth"
+
 checkpoint_existe = False
 try:
-    p = hf_hub_download(HF_REPO, "monia_entrainee.pth", token=HF_TOKEN)
+    p = hf_hub_download(HF_REPO, CHECKPOINT_NOM_HUB, token=HF_TOKEN)
     import shutil
     shutil.copy(p, CHECKPOINT_PATH)
     checkpoint_existe = True
     print(f"Got existing checkpoint ({os.path.getsize(CHECKPOINT_PATH)/1e6:.0f} MB) -- resuming.", flush=True)
 except Exception:
-    print("No checkpoint on the Hub yet -- starting from the plain pretrained model.", flush=True)
+    print("No checkpoint of this model on the Hub yet -- starting from the plain pretrained model.", flush=True)
 
 
 def push_vers_hub(message):
-    for chemin, nom in ((CHECKPOINT_PATH, "monia_entrainee.pth"), (DB_PATH, "memoire.db")):
+    for chemin, nom in ((CHECKPOINT_PATH, CHECKPOINT_NOM_HUB), (DB_PATH, "memoire.db")):
         if os.path.exists(chemin):
             upload_file(
                 path_or_fileobj=chemin, path_in_repo=nom, repo_id=HF_REPO,
@@ -213,12 +226,25 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 if checkpoint_existe:
+    # Resuming: the earlier run already merged its LoRA adapter into a
+    # regular full state dict (see the save step below), so this loads
+    # like any other checkpoint -- no PEFT wrapping needed here, only for
+    # a *fresh* start (below), which needs to freeze the base weights.
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(NOM_MODELE)
-    model = AutoModelForCausalLM.from_config(config).to(device)
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16).to(device)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
 else:
-    model = AutoModelForCausalLM.from_pretrained(NOM_MODELE).to(device)
+    # fp16 base weights (not fp32) is what makes this fit in 7GB -- frozen,
+    # so precision here barely matters; only the small LoRA adapter (fp32,
+    # for stable gradients) actually gets trained.
+    base_model = AutoModelForCausalLM.from_pretrained(NOM_MODELE, torch_dtype=torch.float16).to(device)
+    lora_config = LoraConfig(
+        r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    )
+    model = get_peft_model(base_model, lora_config)
+    model.print_trainable_parameters()
 
 print("Loading training pairs...", flush=True)
 paires = charger_paires(DB_PATH)
@@ -239,10 +265,31 @@ textes = [
 ]
 
 model.train()
-# Plain SGD, no momentum: zero extra per-parameter state, since a
-# GitHub-hosted runner only has 7GB RAM (AdamW's extra state would not fit
-# even for the 0.5B model with real headroom to spare).
-optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+# AdamW is fine here (unlike the earlier full-fine-tune attempts) because
+# only the small LoRA adapter has trainable parameters -- its extra
+# per-parameter state is a few MB, not gigabytes.
+optimizer = torch.optim.AdamW(
+    [p for p in model.parameters() if p.requires_grad], lr=2e-4
+)
+
+
+def sauvegarder_checkpoint():
+    """Merge the LoRA adapter into the base weights (reversibly -- training
+    can continue right after) and save a plain, resumable state dict."""
+    est_peft = isinstance(model, PeftModel)
+    if est_peft:
+        model.merge_adapter()
+        modele_a_sauver = model.get_base_model()
+    else:
+        modele_a_sauver = model
+    modele_a_sauver.eval()
+    etat_fp16 = {k: v.half() for k, v in modele_a_sauver.state_dict().items()}
+    torch.save(etat_fp16, CHECKPOINT_PATH)
+    if est_peft:
+        model.unmerge_adapter()
+    model.train()
+
+
 batch_size = 4
 total_lots = (len(textes) + batch_size - 1) // batch_size
 print(f"[TRAIN] {len(textes)} exemples, {total_lots} lots.", flush=True)
@@ -288,17 +335,11 @@ for i in range(0, len(textes), batch_size):
               f"{ecoule:.0f}s elapsed - {temps_restant():.0f}s left in budget", flush=True)
 
     if time.time() - dernier_push >= CHECKPOINT_PUSH_EVERY_S:
-        model.eval()
-        model.half()
-        torch.save(model.state_dict(), CHECKPOINT_PATH)
-        model.float()
-        model.train()
+        sauvegarder_checkpoint()
         push_vers_hub(f"mid-run checkpoint, {lots_faits} batches this run")
         dernier_push = time.time()
 
 # --- step 4: final save + push ----------------------------------------------
-model.eval()
-model.half()
-torch.save(model.state_dict(), CHECKPOINT_PATH)
+sauvegarder_checkpoint()
 push_vers_hub(f"run complete: {lots_faits} batches this run")
 print("DONE", flush=True)
