@@ -1,0 +1,37 @@
+name: Train Monia
+
+on:
+  schedule:
+    # Every 6 hours. The script itself stops after 5h30m, leaving a buffer
+    # before GitHub's hard 6-hour job limit so the final checkpoint upload
+    # always has time to complete.
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
+
+# Only one run at a time -- a second run starting before the first finishes
+# would download stale state and could overwrite the first run's progress.
+concurrency:
+  group: monia-training
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # 5h55m -- just under GitHub's 6h hard cap
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
+          HF_REPO: svvdesign/monia-checkpoint
+          GEMINI_CIBLE: "500"
+        run: python pipeline_train.py
