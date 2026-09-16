@@ -171,20 +171,38 @@ else:
 
 
 # --- step 3: train for whatever's left of the budget ------------------------
-MOTIF_TOUR_ASSISTANT = re.compile(r"<\|im_start\|>assistant\n(.*?)<\|im_end\|>", re.S)
 LONGUEUR_MAX_SEQUENCE = 256
 
 
-def construire_labels_assistant_seulement(texte, tokenizer, max_length):
-    encodage = tokenizer(texte, truncation=True, max_length=max_length, return_offsets_mapping=True)
-    labels = [-100] * len(encodage["input_ids"])
-    for m in MOTIF_TOUR_ASSISTANT.finditer(texte):
-        for i, (d, f) in enumerate(encodage["offset_mapping"]):
-            if d == f:
-                continue
-            if d >= m.start() and f <= m.end():
-                labels[i] = encodage["input_ids"][i]
-    return encodage["input_ids"], labels
+def construire_ids_et_labels(question, reponse, tokenizer, max_length):
+    """Mask everything except the assistant's own response -- by TOKEN-LENGTH
+    boundary, not by regex-matching a specific chat template's special
+    tokens. Confirmed real bug this replaces: DeepSeek-R1-Distill-Qwen does
+    not use Qwen's ChatML <|im_start|>/<|im_end|> markers, so a regex tuned
+    for that format silently matched nothing -- every batch ended up with
+    zero real labels and the whole training loop skipped every batch
+    without doing any actual compute. Rendering the system+user prefix
+    alone (with add_generation_prompt=True) and comparing its token length
+    against the full system+user+assistant rendering works for ANY chat
+    template, since it never inspects the template's actual tokens."""
+    messages_prefixe = [
+        {"role": "system", "content": SYSTEM_PROMPT_ENTRAINEMENT},
+        {"role": "user", "content": question},
+    ]
+    prefixe_texte = tokenizer.apply_chat_template(messages_prefixe, tokenize=False, add_generation_prompt=True)
+    texte_complet = tokenizer.apply_chat_template(
+        messages_prefixe + [{"role": "assistant", "content": reponse}],
+        tokenize=False, add_generation_prompt=False,
+    )
+
+    ids_prefixe = tokenizer(prefixe_texte, add_special_tokens=False)["input_ids"]
+    ids_complet = tokenizer(
+        texte_complet, truncation=True, max_length=max_length, add_special_tokens=False
+    )["input_ids"]
+
+    n_prefixe = min(len(ids_prefixe), len(ids_complet))
+    labels = [-100] * n_prefixe + ids_complet[n_prefixe:]
+    return ids_complet, labels
 
 
 def charger_paires(db_path, max_par_table=8000):
@@ -252,17 +270,6 @@ print(f"{len(paires)} pairs loaded", flush=True)
 
 import random
 random.shuffle(paires)
-textes = [
-    tokenizer.apply_chat_template(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT_ENTRAINEMENT},
-            {"role": "user", "content": q},
-            {"role": "assistant", "content": a},
-        ],
-        tokenize=False,
-    )
-    for q, a in paires
-]
 
 model.train()
 # AdamW is fine here (unlike the earlier full-fine-tune attempts) because
@@ -291,19 +298,19 @@ def sauvegarder_checkpoint():
 
 
 batch_size = 4
-total_lots = (len(textes) + batch_size - 1) // batch_size
-print(f"[TRAIN] {len(textes)} exemples, {total_lots} lots.", flush=True)
+total_lots = (len(paires) + batch_size - 1) // batch_size
+print(f"[TRAIN] {len(paires)} exemples, {total_lots} lots.", flush=True)
 
 debut_entrainement = time.time()
 dernier_push = time.time()
 lots_faits = 0
-for i in range(0, len(textes), batch_size):
+for i in range(0, len(paires), batch_size):
     if temps_restant() <= 5 * 60:  # keep 5 min buffer to upload the final checkpoint
         print("Time budget nearly exhausted -- stopping training loop.", flush=True)
         break
 
-    lot = textes[i:i + batch_size]
-    paires_ids_labels = [construire_labels_assistant_seulement(t, tokenizer, LONGUEUR_MAX_SEQUENCE) for t in lot]
+    lot = paires[i:i + batch_size]
+    paires_ids_labels = [construire_ids_et_labels(q, a, tokenizer, LONGUEUR_MAX_SEQUENCE) for q, a in lot]
     paires_ids_labels = [(ids, lab) for ids, lab in paires_ids_labels if any(l != -100 for l in lab)]
     if not paires_ids_labels:
         continue
