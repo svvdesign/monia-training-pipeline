@@ -13,14 +13,8 @@ Runs in a scheduled workflow (no laptop needed). Each invocation:
 4. Uploads the final checkpoint + updated memoire.db back to the Hub.
 
 Runs on GitHub's free hosted runners: 2 CPU cores, 7GB RAM, no GPU.
-That RAM ceiling is why this uses LoRA (freezes the big pretrained model,
-trains only a small adapter) instead of full fine-tuning -- full
-fine-tuning of a 1.5B model needs ~12GB+ even with plain SGD, which does
-not fit; LoRA on the frozen fp16 base needs only ~3-4GB. LoRA is also why
-this can afford to use DeepSeek-R1-Distill-Qwen-1.5B (a model distilled
-specifically to reason step-by-step, not just imitate answer tone) instead
-of a plain instruction model -- full fine-tuning that model would not fit
-here at all.
+That RAM ceiling is why this uses the 0.5B model (not 1.5B) and plain
+SGD (no momentum -- AdamW's extra per-parameter state would not fit).
 """
 import os
 import re
@@ -30,7 +24,6 @@ import time
 import requests
 import torch
 from huggingface_hub import hf_hub_download, upload_file
-from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # --- config from environment (set as GitHub Secrets / workflow env) -------
@@ -43,7 +36,7 @@ CHECKPOINT_PUSH_EVERY_S = 20 * 60  # push mid-run progress to the Hub every 20 m
 
 DB_PATH = "/tmp/memoire.db"
 CHECKPOINT_PATH = "/tmp/monia_entrainee.pth"
-NOM_MODELE = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+NOM_MODELE = "Qwen/Qwen2.5-0.5B-Instruct"
 device = "cpu"
 
 debut_script = time.time()
@@ -66,25 +59,19 @@ except Exception as e:
         "It needs to exist there before the first run -- upload it once manually."
     )
 
-# Filename includes the model name deliberately -- switching base models
-# (e.g. away from the earlier plain Qwen2.5-0.5B run) means a differently
-# shaped state dict, so this avoids ever trying to load one architecture's
-# weights into another instead of silently crashing on a shape mismatch.
-CHECKPOINT_NOM_HUB = "monia_deepseek_r1_distill_1.5b_lora_merged.pth"
-
 checkpoint_existe = False
 try:
-    p = hf_hub_download(HF_REPO, CHECKPOINT_NOM_HUB, token=HF_TOKEN)
+    p = hf_hub_download(HF_REPO, "monia_entrainee.pth", token=HF_TOKEN)
     import shutil
     shutil.copy(p, CHECKPOINT_PATH)
     checkpoint_existe = True
     print(f"Got existing checkpoint ({os.path.getsize(CHECKPOINT_PATH)/1e6:.0f} MB) -- resuming.", flush=True)
 except Exception:
-    print("No checkpoint of this model on the Hub yet -- starting from the plain pretrained model.", flush=True)
+    print("No checkpoint on the Hub yet -- starting from the plain pretrained model.", flush=True)
 
 
 def push_vers_hub(message):
-    for chemin, nom in ((CHECKPOINT_PATH, CHECKPOINT_NOM_HUB), (DB_PATH, "memoire.db")):
+    for chemin, nom in ((CHECKPOINT_PATH, "monia_entrainee.pth"), (DB_PATH, "memoire.db")):
         if os.path.exists(chemin):
             upload_file(
                 path_or_fileobj=chemin, path_in_repo=nom, repo_id=HF_REPO,
@@ -171,38 +158,20 @@ else:
 
 
 # --- step 3: train for whatever's left of the budget ------------------------
+MOTIF_TOUR_ASSISTANT = re.compile(r"<\|im_start\|>assistant\n(.*?)<\|im_end\|>", re.S)
 LONGUEUR_MAX_SEQUENCE = 256
 
 
-def construire_ids_et_labels(question, reponse, tokenizer, max_length):
-    """Mask everything except the assistant's own response -- by TOKEN-LENGTH
-    boundary, not by regex-matching a specific chat template's special
-    tokens. Confirmed real bug this replaces: DeepSeek-R1-Distill-Qwen does
-    not use Qwen's ChatML <|im_start|>/<|im_end|> markers, so a regex tuned
-    for that format silently matched nothing -- every batch ended up with
-    zero real labels and the whole training loop skipped every batch
-    without doing any actual compute. Rendering the system+user prefix
-    alone (with add_generation_prompt=True) and comparing its token length
-    against the full system+user+assistant rendering works for ANY chat
-    template, since it never inspects the template's actual tokens."""
-    messages_prefixe = [
-        {"role": "system", "content": SYSTEM_PROMPT_ENTRAINEMENT},
-        {"role": "user", "content": question},
-    ]
-    prefixe_texte = tokenizer.apply_chat_template(messages_prefixe, tokenize=False, add_generation_prompt=True)
-    texte_complet = tokenizer.apply_chat_template(
-        messages_prefixe + [{"role": "assistant", "content": reponse}],
-        tokenize=False, add_generation_prompt=False,
-    )
-
-    ids_prefixe = tokenizer(prefixe_texte, add_special_tokens=False)["input_ids"]
-    ids_complet = tokenizer(
-        texte_complet, truncation=True, max_length=max_length, add_special_tokens=False
-    )["input_ids"]
-
-    n_prefixe = min(len(ids_prefixe), len(ids_complet))
-    labels = [-100] * n_prefixe + ids_complet[n_prefixe:]
-    return ids_complet, labels
+def construire_labels_assistant_seulement(texte, tokenizer, max_length):
+    encodage = tokenizer(texte, truncation=True, max_length=max_length, return_offsets_mapping=True)
+    labels = [-100] * len(encodage["input_ids"])
+    for m in MOTIF_TOUR_ASSISTANT.finditer(texte):
+        for i, (d, f) in enumerate(encodage["offset_mapping"]):
+            if d == f:
+                continue
+            if d >= m.start() and f <= m.end():
+                labels[i] = encodage["input_ids"][i]
+    return encodage["input_ids"], labels
 
 
 def charger_paires(db_path, max_par_table=8000):
@@ -244,25 +213,12 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 if checkpoint_existe:
-    # Resuming: the earlier run already merged its LoRA adapter into a
-    # regular full state dict (see the save step below), so this loads
-    # like any other checkpoint -- no PEFT wrapping needed here, only for
-    # a *fresh* start (below), which needs to freeze the base weights.
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(NOM_MODELE)
-    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16).to(device)
+    model = AutoModelForCausalLM.from_config(config).to(device)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
 else:
-    # fp16 base weights (not fp32) is what makes this fit in 7GB -- frozen,
-    # so precision here barely matters; only the small LoRA adapter (fp32,
-    # for stable gradients) actually gets trained.
-    base_model = AutoModelForCausalLM.from_pretrained(NOM_MODELE, torch_dtype=torch.float16).to(device)
-    lora_config = LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    )
-    model = get_peft_model(base_model, lora_config)
-    model.print_trainable_parameters()
+    model = AutoModelForCausalLM.from_pretrained(NOM_MODELE).to(device)
 
 print("Loading training pairs...", flush=True)
 paires = charger_paires(DB_PATH)
@@ -270,58 +226,37 @@ print(f"{len(paires)} pairs loaded", flush=True)
 
 import random
 random.shuffle(paires)
+textes = [
+    tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT_ENTRAINEMENT},
+            {"role": "user", "content": q},
+            {"role": "assistant", "content": a},
+        ],
+        tokenize=False,
+    )
+    for q, a in paires
+]
 
 model.train()
-# AdamW is fine here (unlike the earlier full-fine-tune attempts) because
-# only the small LoRA adapter has trainable parameters -- its extra
-# per-parameter state is a few MB, not gigabytes.
-optimizer = torch.optim.AdamW(
-    [p for p in model.parameters() if p.requires_grad], lr=2e-4
-)
-
-
-def sauvegarder_checkpoint():
-    """Save a plain, resumable state dict with the LoRA adapter folded in.
-
-    Confirmed real bug this replaces: merge_adapter() + get_base_model()
-    does NOT flatten LoRA into plain .weight tensors in this PEFT version
-    -- the target layers stay wrapped as .base_layer/.lora_A/.lora_B, so
-    the saved state dict didn't match the plain architecture at all and
-    the NEXT run's load_state_dict() failed with "Missing/Unexpected
-    key(s)". merge_and_unload() actually flattens them, but it's
-    destructive (replaces the live layers, no going back) -- so it runs on
-    a deep copy, leaving the real training model untouched, and the copy
-    is dropped right after saving.
-    """
-    if isinstance(model, PeftModel):
-        import copy
-        import gc
-        copie = copy.deepcopy(model).merge_and_unload()
-        copie.eval()
-        etat_fp16 = {k: v.half() for k, v in copie.state_dict().items()}
-        del copie
-        gc.collect()
-    else:
-        model.eval()
-        etat_fp16 = {k: v.half() for k, v in model.state_dict().items()}
-        model.train()
-    torch.save(etat_fp16, CHECKPOINT_PATH)
-
-
+# Plain SGD, no momentum: zero extra per-parameter state, since a
+# GitHub-hosted runner only has 7GB RAM (AdamW's extra state would not fit
+# even for the 0.5B model with real headroom to spare).
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
 batch_size = 4
-total_lots = (len(paires) + batch_size - 1) // batch_size
-print(f"[TRAIN] {len(paires)} exemples, {total_lots} lots.", flush=True)
+total_lots = (len(textes) + batch_size - 1) // batch_size
+print(f"[TRAIN] {len(textes)} exemples, {total_lots} lots.", flush=True)
 
 debut_entrainement = time.time()
 dernier_push = time.time()
 lots_faits = 0
-for i in range(0, len(paires), batch_size):
+for i in range(0, len(textes), batch_size):
     if temps_restant() <= 5 * 60:  # keep 5 min buffer to upload the final checkpoint
         print("Time budget nearly exhausted -- stopping training loop.", flush=True)
         break
 
-    lot = paires[i:i + batch_size]
-    paires_ids_labels = [construire_ids_et_labels(q, a, tokenizer, LONGUEUR_MAX_SEQUENCE) for q, a in lot]
+    lot = textes[i:i + batch_size]
+    paires_ids_labels = [construire_labels_assistant_seulement(t, tokenizer, LONGUEUR_MAX_SEQUENCE) for t in lot]
     paires_ids_labels = [(ids, lab) for ids, lab in paires_ids_labels if any(l != -100 for l in lab)]
     if not paires_ids_labels:
         continue
@@ -353,11 +288,17 @@ for i in range(0, len(paires), batch_size):
               f"{ecoule:.0f}s elapsed - {temps_restant():.0f}s left in budget", flush=True)
 
     if time.time() - dernier_push >= CHECKPOINT_PUSH_EVERY_S:
-        sauvegarder_checkpoint()
+        model.eval()
+        model.half()
+        torch.save(model.state_dict(), CHECKPOINT_PATH)
+        model.float()
+        model.train()
         push_vers_hub(f"mid-run checkpoint, {lots_faits} batches this run")
         dernier_push = time.time()
 
 # --- step 4: final save + push ----------------------------------------------
-sauvegarder_checkpoint()
+model.eval()
+model.half()
+torch.save(model.state_dict(), CHECKPOINT_PATH)
 push_vers_hub(f"run complete: {lots_faits} batches this run")
 print("DONE", flush=True)
