@@ -281,20 +281,31 @@ optimizer = torch.optim.AdamW(
 
 
 def sauvegarder_checkpoint():
-    """Merge the LoRA adapter into the base weights (reversibly -- training
-    can continue right after) and save a plain, resumable state dict."""
-    est_peft = isinstance(model, PeftModel)
-    if est_peft:
-        model.merge_adapter()
-        modele_a_sauver = model.get_base_model()
+    """Save a plain, resumable state dict with the LoRA adapter folded in.
+
+    Confirmed real bug this replaces: merge_adapter() + get_base_model()
+    does NOT flatten LoRA into plain .weight tensors in this PEFT version
+    -- the target layers stay wrapped as .base_layer/.lora_A/.lora_B, so
+    the saved state dict didn't match the plain architecture at all and
+    the NEXT run's load_state_dict() failed with "Missing/Unexpected
+    key(s)". merge_and_unload() actually flattens them, but it's
+    destructive (replaces the live layers, no going back) -- so it runs on
+    a deep copy, leaving the real training model untouched, and the copy
+    is dropped right after saving.
+    """
+    if isinstance(model, PeftModel):
+        import copy
+        import gc
+        copie = copy.deepcopy(model).merge_and_unload()
+        copie.eval()
+        etat_fp16 = {k: v.half() for k, v in copie.state_dict().items()}
+        del copie
+        gc.collect()
     else:
-        modele_a_sauver = model
-    modele_a_sauver.eval()
-    etat_fp16 = {k: v.half() for k, v in modele_a_sauver.state_dict().items()}
+        model.eval()
+        etat_fp16 = {k: v.half() for k, v in model.state_dict().items()}
+        model.train()
     torch.save(etat_fp16, CHECKPOINT_PATH)
-    if est_peft:
-        model.unmerge_adapter()
-    model.train()
 
 
 batch_size = 4
