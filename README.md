@@ -31,6 +31,6 @@ model manually on Kaggle when convenient; the two aren't exclusive.
 - **Actions tab** on this repo shows every run, live logs, and lets you
   trigger one manually ("Run workflow").
 - The current checkpoint is always at
-  `https://huggingface.co/svvdesign/monia-checkpoint`.
+  `https://huggingface.co/saad3443/monia-checkpoint`.
 - To pull the latest checkpoint down to your Mac, download
   `monia_entrainee.pth` from that Hugging Face repo's Files tab.

@@ -32,6 +32,6 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
-          HF_REPO: svvdesign/monia-checkpoint
+          HF_REPO: saad3443/monia-checkpoint
           GEMINI_CIBLE: "500"
         run: python pipeline_train.py

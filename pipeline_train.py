@@ -28,7 +28,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # --- config from environment (set as GitHub Secrets / workflow env) -------
 HF_TOKEN = os.environ["HF_TOKEN"]
-HF_REPO = os.environ.get("HF_REPO", "svvdesign/monia-checkpoint")
+HF_REPO = os.environ.get("HF_REPO", "saad3443/monia-checkpoint")
 GEMINI_KEYS = [k.strip() for k in os.environ.get("GEMINI_KEYS", "").splitlines() if k.strip()]
 GEMINI_CIBLE = int(os.environ.get("GEMINI_CIBLE", "500"))
 TOTAL_BUDGET_S = int(os.environ.get("TOTAL_BUDGET_S", str(5 * 3600 + 30 * 60)))  # 5h30m, under the 6h hard cap
